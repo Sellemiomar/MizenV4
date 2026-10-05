@@ -1,0 +1,107 @@
+import { CANONICAL_PRODUCTS, CANONICAL_PROVIDERS } from './canonicalCatalogue';
+import { CLAIMS_REPOSITORY } from './claimsRepository';
+import { FinancingClaim } from '../types/claims';
+import { FinancingProduct } from '../types/knowledge';
+
+function rank(c: FinancingClaim): number {
+  if (c.ruleStatus === 'VERIFIED_HISTORICAL' || c.operationalStatus === 'HISTORICAL_ONLY') return -100;
+  if (c.evidenceStrength === 'DIRECT_PRIMARY_CURRENT' && c.ruleStatus === 'VERIFIED_CURRENT') return 100;
+  if (c.ruleStatus === 'UNKNOWN') return 80;
+  if (c.ruleStatus === 'PARTIALLY_VERIFIED') return 60;
+  if (c.evidenceStrength === 'OFFICIAL_SECONDARY') return 40;
+  if (c.evidenceStrength === 'SECONDARY') return 20;
+  return 0;
+}
+
+export function getAuthoritativeClaim(entityId: string, field: string): FinancingClaim | undefined {
+  return CLAIMS_REPOSITORY.getAllClaims(entityId)
+    .filter(c => c.field === field && c.conflictStatus !== 'SUPERSEDED')
+    .filter(c => c.ruleStatus !== 'VERIFIED_HISTORICAL' && c.operationalStatus !== 'HISTORICAL_ONLY')
+    .sort((a,b) => rank(b)-rank(a) || String(b.retrievalDate).localeCompare(String(a.retrievalDate)))[0];
+}
+
+function applyClaim(product: FinancingProduct, claim: FinancingClaim): void {
+  const updateCriterion = (field: string, operator: string, expectedValue: unknown) => {
+    const criterion = product.criteria.find(c => c.field === field && c.operator === operator);
+    if (criterion) criterion.expectedValue = expectedValue;
+  };
+
+  switch (claim.field) {
+    case 'minProjectCost':
+      if (typeof claim.value === 'number') { product.financialTerms.projectCost = { ...product.financialTerms.projectCost, min: claim.value, currency: 'TND' }; updateCriterion('totalProjectCost', 'GTE', claim.value); }
+      break;
+    case 'maxProjectCost':
+      if (typeof claim.value === 'number') { product.financialTerms.projectCost = { ...product.financialTerms.projectCost, max: claim.value, currency: 'TND' }; updateCriterion('totalProjectCost', 'LTE', claim.value); }
+      break;
+    case 'maxFinancingAmount':
+      if (typeof claim.value === 'number') { product.financialTerms.amount = { ...product.financialTerms.amount, max: claim.value, currency: 'TND' }; updateCriterion('financingRequested', 'LTE', claim.value); }
+      break;
+    case 'publishedMarginRange': {
+      const v = claim.value as { min?: number; max?: number };
+      if (typeof v?.min === 'number' && typeof v?.max === 'number') {
+        product.financialTerms.rate = {
+          ...product.financialTerms.rate,
+          type: 'UNKNOWN',
+          margin: undefined,
+          referenceIndex: undefined,
+          min: v.min / 100,
+          max: v.max / 100,
+          currency: 'PERCENT',
+          explanation: {
+            fr: `Marge publiée : ${v.min} à ${v.max} points de pourcentage. Relation avec le TMM non établie.`,
+            ar: `الهامش المنشور: من ${v.min} إلى ${v.max} نقطة مئوية. العلاقة مع TMM غير مثبتة.`
+          }
+        };
+      }
+      break;
+    }
+    case 'pricingRelationship':
+      if (claim.value === 'UNKNOWN') {
+        const existing = product.financialTerms.rate?.explanation?.fr || '';
+        const range = existing.match(/\d+(?:[.,]\d+)? à \d+(?:[.,]\d+)?/i)?.[0]?.replace(',', '.');
+        product.financialTerms.rate = {
+          ...product.financialTerms.rate,
+          type: 'UNKNOWN',
+          margin: undefined,
+          referenceIndex: undefined,
+          explanation: {
+            fr: range
+              ? `Marge publiée : ${range} points. Relation de tarification avec le TMM inconnue. Aucune formule ou majoration TMM établie.`
+              : 'Relation de tarification avec le TMM inconnue. Aucune formule ou majoration TMM établie.',
+            ar: 'العلاقة الدقيقة مع TMM غير معلومة. لا توجد صيغة تسعير مثبتة مع TMM.'
+          }
+        };
+      }
+      break;
+  }
+}
+
+export function getAuthoritativeCatalogueProducts(): FinancingProduct[] {
+  return CANONICAL_PRODUCTS.map(base => {
+    const product = structuredClone(base) as FinancingProduct;
+    const fields = new Set(CLAIMS_REPOSITORY.getAllClaims(base.id).map(c => c.field));
+    for (const field of fields) {
+      const claim = getAuthoritativeClaim(base.id, field);
+      if (claim) applyClaim(product, claim);
+    }
+    return product;
+  });
+}
+
+export function getAuthoritativeCatalogueMetadata() {
+  const products = getAuthoritativeCatalogueProducts();
+  const providers = getAuthoritativeCatalogueProviders();
+  return {
+    productCount: products.length,
+    providerCount: providers.length,
+    sourceCount: providers.reduce((n,p) => n + p.sources.length, 0) + products.reduce((n,p) => n + p.sources.length, 0)
+  };
+}
+
+export function getAuthoritativeCatalogueProviders() {
+  return CANONICAL_PROVIDERS;
+}
+
+export function getAuthoritativeCatalogueProduct(id: string): FinancingProduct | undefined {
+  return getAuthoritativeCatalogueProducts().find(p => p.id === id);
+}
